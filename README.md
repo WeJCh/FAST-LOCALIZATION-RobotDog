@@ -96,7 +96,7 @@ FAST-LOCALIZATION 是基于 [FAST-LIO2](https://github.com/hku-mars/FAST_LIO) �
 当前仓库已经将 `include/ikd-Tree` 的源码直接纳入 Git 版本控制，因此正常克隆本仓库即可获得它。将以下地址替换为你发布到 GitHub 的定位仓库地址：
 
 ```bash
-cd "$WORKSPACE/src"
+cd ~/catkin_ws/src
 git clone https://github.com/WeJCh/FAST-LOCALIZATION-RobotDog FAST-LOCALIZATION
 ```
 
@@ -110,13 +110,13 @@ git clone https://github.com/WeJCh/FAST-LOCALIZATION-RobotDog FAST-LOCALIZATION
 
 ```bash
 source /opt/ros/noetic/setup.bash
-cd "$WORKSPACE"
+cd ~/catkin_ws
 catkin_make -DCMAKE_BUILD_TYPE=RelWithDebInfo \
   -DFAST_LOCALIZATION_WITH_LIVOX=OFF -j4
 source devel/setup.bash
 ```
 
-`$WORKSPACE` 是 catkin 工作空间根目录。若工作空间中同时保留建图与定位包，确认两个包均已被 catkin 发现后再运行；不要把两套同名可执行文件或旧版配置混入同一个启动命令。
+本文所有命令固定以 `~/catkin_ws` 作为 catkin 工作空间根目录，这与当前机器狗工程的实际目录一致。若你的工作空间确实不在该位置，需要将文中所有 `~/catkin_ws` 整体替换为你的实际路径；不要只替换其中一条命令。若工作空间中同时保留建图与定位包，确认两个包均已被 catkin 发现后再运行；不要把两套同名可执行文件或旧版配置混入同一个启动命令。
 
 ## 6. 运行一次定位实验
 
@@ -126,7 +126,7 @@ source devel/setup.bash
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source "$WORKSPACE/devel/setup.bash"
+source ~/catkin_ws/devel/setup.bash
 unset OMP_NUM_THREADS
 roslaunch fast_localization localization_robotdog.launch \
   rviz:=false \
@@ -139,8 +139,8 @@ roslaunch fast_localization localization_robotdog.launch \
 
 ```bash
 source /opt/ros/noetic/setup.bash
-source "$WORKSPACE/devel/setup.bash"
-python3 "$WORKSPACE/src/FAST-LIVO2/scripts/play_ros2_robotdog_to_ros1.py" \
+source ~/catkin_ws/devel/setup.bash
+python3 ~/catkin_ws/src/FAST-LIVO2/scripts/play_ros2_robotdog_to_ros1.py \
   "$DATASET_DIR" --rate 1.0 --skip-images --wait-subscribers
 ```
 

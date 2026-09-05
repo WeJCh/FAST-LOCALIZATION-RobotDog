@@ -1,7 +1,12 @@
 #include <ros/ros.h>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <pcl_conversions/pcl_conversions.h>
 #include <sensor_msgs/PointCloud2.h>
+#ifdef FAST_LOCALIZATION_WITH_LIVOX
 #include <livox_ros_driver/CustomMsg.h>
+#endif
 
 using namespace std;
 
@@ -10,7 +15,7 @@ using namespace std;
 typedef pcl::PointXYZINormal PointType;
 typedef pcl::PointCloud<PointType> PointCloudXYZI;
 
-enum LID_TYPE{AVIA = 1, VELO16, OUST64}; //{1, 2, 3}
+enum LID_TYPE{AVIA = 1, VELO16, OUST64, ROBOTDOG = 8};
 enum TIME_UNIT{SEC = 0, MS = 1, US = 2, NS = 3};
 enum Feature{Nor, Poss_Plane, Real_Plane, Edge_Jump, Edge_Plane, Wire, ZeroPoint};
 enum Surround{Prev, Next};
@@ -79,6 +84,26 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(ouster_ros::Point,
     (std::uint32_t, range, range)
 )
 
+namespace robotdog_ros {
+  struct EIGEN_ALIGN16 Point {
+      PCL_ADD_POINT4D;
+      float intensity;
+      std::uint8_t tag;
+      std::uint8_t line;
+      double timestamp;
+      EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  };
+}
+POINT_CLOUD_REGISTER_POINT_STRUCT(robotdog_ros::Point,
+    (float, x, x)
+    (float, y, y)
+    (float, z, z)
+    (float, intensity, intensity)
+    (std::uint8_t, tag, tag)
+    (std::uint8_t, line, line)
+    (double, timestamp, timestamp)
+)
+
 class Preprocess
 {
   public:
@@ -87,7 +112,9 @@ class Preprocess
   Preprocess();
   ~Preprocess();
   
+#ifdef FAST_LOCALIZATION_WITH_LIVOX
   void process(const livox_ros_driver::CustomMsg::ConstPtr &msg, PointCloudXYZI::Ptr &pcl_out);
+#endif
   void process(const sensor_msgs::PointCloud2::ConstPtr &msg, PointCloudXYZI::Ptr &pcl_out);
   void set(bool feat_en, int lid_type, double bld, int pfilt_num);
 
@@ -103,9 +130,12 @@ class Preprocess
     
 
   private:
+#ifdef FAST_LOCALIZATION_WITH_LIVOX
   void avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg);
+#endif
   void oust64_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
   void velodyne_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
+  void robotdog_handler(const sensor_msgs::PointCloud2::ConstPtr &msg);
   void give_feature(PointCloudXYZI &pl, vector<orgtype> &types);
   void pub_func(PointCloudXYZI &pl, const ros::Time &ct);
   int  plane_judge(const PointCloudXYZI &pl, vector<orgtype> &types, uint i, uint &i_nex, Eigen::Vector3d &curr_direct);

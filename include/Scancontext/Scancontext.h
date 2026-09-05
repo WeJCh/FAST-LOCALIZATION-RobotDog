@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ctime>
+#include <cstddef>
 #include <cassert>
 #include <cmath>
 #include <utility>
@@ -9,6 +10,7 @@
 #include <cstdlib>
 #include <memory>
 #include <iostream>
+#include <limits>
 
 #include <Eigen/Dense>
 
@@ -70,7 +72,7 @@ public:
 
     // User-side API
     void makeAndSaveScancontextAndKeys( pcl::PointCloud<SCPointType> & _scan_down );
-    std::pair<int, float> detectLoopClosureID( void ); // int: nearest node index, float: relative yaw
+    std::pair<int, float> detectLoopClosureID( int num_exclude_recent = 50 ); // int: nearest node index, float: relative yaw
     void dropBackScancontextAndKeys();
 
 
@@ -106,6 +108,7 @@ public:
     KeyMat polarcontext_invkeys_mat_;
     KeyMat polarcontext_invkeys_to_search_;
     std::unique_ptr<InvKeyTree> polarcontext_tree_;
+    std::size_t polarcontext_tree_search_size_ = 0;
 
 }; // SCManager
 

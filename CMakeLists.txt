@@ -38,10 +38,9 @@ find_package(OpenMP QUIET)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS}   ${OpenMP_C_FLAGS}")
 
-find_package(PythonLibs REQUIRED)
-find_path(MATPLOTLIB_CPP_INCLUDE_DIRS "matplotlibcpp.h")
+option(FAST_LOCALIZATION_WITH_LIVOX "Build Livox CustomMsg input support" OFF)
 
-find_package(catkin REQUIRED COMPONENTS
+set(FAST_LOCALIZATION_CATKIN_COMPONENTS
   geometry_msgs
   nav_msgs
   sensor_msgs
@@ -50,10 +49,16 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
   pcl_ros
   tf
-  livox_ros_driver
   message_generation
   eigen_conversions
 )
+
+if(FAST_LOCALIZATION_WITH_LIVOX)
+  list(APPEND FAST_LOCALIZATION_CATKIN_COMPONENTS livox_ros_driver)
+  add_definitions(-DFAST_LOCALIZATION_WITH_LIVOX)
+endif()
+
+find_package(catkin REQUIRED COMPONENTS ${FAST_LOCALIZATION_CATKIN_COMPONENTS})
 
 find_package(Eigen3 REQUIRED)
 find_package(PCL 1.8 REQUIRED)
@@ -65,7 +70,6 @@ include_directories(
 	${catkin_INCLUDE_DIRS} 
   ${EIGEN3_INCLUDE_DIR}
   ${PCL_INCLUDE_DIRS}
-  ${PYTHON_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
   include)
 
@@ -86,5 +90,5 @@ catkin_package(
 )
 
 add_executable(fast_localization src/laserMapping.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp include/Scancontext/Scancontext.cpp)
-target_link_libraries(fast_localization ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${PYTHON_LIBRARIES})
-target_include_directories(fast_localization PRIVATE ${PYTHON_INCLUDE_DIRS} ${OpenCV_LIBRARIES})
+target_link_libraries(fast_localization ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBS})
+target_include_directories(fast_localization PRIVATE ${OpenCV_INCLUDE_DIRS})

@@ -22,17 +22,9 @@ float deg2rad(float degrees)
 
 float xy2theta( const float & _x, const float & _y )
 {
-    if ( _x >= 0 & _y >= 0) 
-        return (180/M_PI) * atan(_y / _x);
-
-    if ( _x < 0 & _y >= 0) 
-        return 180 - ( (180/M_PI) * atan(_y / (-_x)) );
-
-    if ( _x < 0 & _y < 0) 
-        return 180 + ( (180/M_PI) * atan(_y / _x) );
-
-    if ( _x >= 0 & _y < 0)
-        return 360 - ( (180/M_PI) * atan((-_y) / _x) );
+    float angle = std::atan2(_y, _x) * 180.0f / static_cast<float>(M_PI);
+    if (angle < 0.0f) angle += 360.0f;
+    return angle;
 } // xy2theta
 
 
@@ -74,16 +66,22 @@ double SCManager::distDirectSC ( MatrixXd &_sc1, MatrixXd &_sc2 )
     {
         VectorXd col_sc1 = _sc1.col(col_idx);
         VectorXd col_sc2 = _sc2.col(col_idx);
-        
-        if( col_sc1.norm() == 0 | col_sc2.norm() == 0 )
+
+        const double norm_sc1 = col_sc1.norm();
+        const double norm_sc2 = col_sc2.norm();
+        if (norm_sc1 == 0.0 || norm_sc2 == 0.0)
             continue; // don't count this sector pair. 
 
-        double sector_similarity = col_sc1.dot(col_sc2) / (col_sc1.norm() * col_sc2.norm());
+        const double sector_similarity = std::max(
+            -1.0, std::min(1.0, col_sc1.dot(col_sc2) / (norm_sc1 * norm_sc2)));
 
         sum_sector_similarity = sum_sector_similarity + sector_similarity;
         num_eff_cols = num_eff_cols + 1;
     }
     
+    if (num_eff_cols == 0)
+        return std::numeric_limits<double>::infinity();
+
     double sc_sim = sum_sector_similarity / num_eff_cols;
     return 1.0 - sc_sim;
 
@@ -166,6 +164,8 @@ MatrixXd SCManager::makeScancontext( pcl::PointCloud<SCPointType> & _scan_down )
         pt.x = _scan_down.points[pt_idx].x; 
         pt.y = _scan_down.points[pt_idx].y;
         pt.z = _scan_down.points[pt_idx].z + LIDAR_HEIGHT; // naive adding is ok (all points should be > 0).
+        if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
+            continue;
 
         // xyz to ring, sector
         azim_range = sqrt(pt.x * pt.x + pt.y * pt.y);
@@ -245,103 +245,81 @@ void SCManager::makeAndSaveScancontextAndKeys( pcl::PointCloud<SCPointType> & _s
 
 void SCManager::dropBackScancontextAndKeys()
 {
+    if (polarcontexts_.empty()) return;
     polarcontexts_.pop_back();
     polarcontext_invkeys_.pop_back();
     polarcontext_vkeys_.pop_back();
     polarcontext_invkeys_mat_.pop_back();
 }
 
-std::pair<int, float> SCManager::detectLoopClosureID ( void )
+std::pair<int, float> SCManager::detectLoopClosureID ( int num_exclude_recent )
 {
-    int loop_id { -1 }; // init with -1, -1 means no loop (== LeGO-LOAM's variable "closestHistoryFrameID")
+    const int no_match = -1;
+    if (polarcontext_invkeys_mat_.empty() || polarcontexts_.empty())
+        return {no_match, 0.0f};
 
-    auto curr_key = polarcontext_invkeys_mat_.back(); // current observation (query)
-    auto curr_desc = polarcontexts_.back(); // current observation (query)
+    const std::size_t exclude_count = static_cast<std::size_t>(std::max(0, num_exclude_recent));
+    if (polarcontext_invkeys_mat_.size() <= exclude_count)
+        return {no_match, 0.0f};
 
-    /* 
-     * step 1: candidates from ringkey tree_
-     */
-    if( polarcontext_invkeys_mat_.size() < NUM_EXCLUDE_RECENT + 1)
-    {
-        std::pair<int, float> result {loop_id, 0.0};
-        return result; // Early return 
-    }
+    const std::size_t searchable_count = polarcontext_invkeys_mat_.size() - exclude_count;
+    const std::vector<float> &curr_key = polarcontext_invkeys_mat_.back();
+    MatrixXd curr_desc = polarcontexts_.back();
 
-    // tree_ reconstruction (not mandatory to make everytime)
-    if( tree_making_period_conter % TREE_MAKING_PERIOD_ == 0) // to save computation cost
+    // In localization mode only the final query descriptor is excluded. The map
+    // descriptor database is static, so rebuild the tree only if its size changes.
+    if (!polarcontext_tree_ || polarcontext_tree_search_size_ != searchable_count)
     {
         TicToc t_tree_construction;
-
-        polarcontext_invkeys_to_search_.clear();
-        polarcontext_invkeys_to_search_.assign( polarcontext_invkeys_mat_.begin(), polarcontext_invkeys_mat_.end() - NUM_EXCLUDE_RECENT ) ;
-
-        polarcontext_tree_.reset(); 
-        polarcontext_tree_ = std::make_unique<InvKeyTree>(PC_NUM_RING /* dim */, polarcontext_invkeys_to_search_, 10 /* max leaf */ );
-        // tree_ptr_->index->buildIndex(); // inernally called in the constructor of InvKeyTree (for detail, refer the nanoflann and KDtreeVectorOfVectorsAdaptor)
+        polarcontext_invkeys_to_search_.assign(
+            polarcontext_invkeys_mat_.begin(),
+            polarcontext_invkeys_mat_.begin() + static_cast<std::ptrdiff_t>(searchable_count));
+        polarcontext_tree_.reset(new InvKeyTree(
+            PC_NUM_RING, polarcontext_invkeys_to_search_, 10));
+        polarcontext_tree_search_size_ = searchable_count;
         t_tree_construction.toc("Tree construction");
     }
-    tree_making_period_conter = tree_making_period_conter + 1;
-        
-    double min_dist = 10000000; // init with somthing large
-    int nn_align = 0;
-    int nn_idx = 0;
 
-    // knn search
-    std::vector<size_t> candidate_indexes( NUM_CANDIDATES_FROM_TREE ); 
-    std::vector<float> out_dists_sqr( NUM_CANDIDATES_FROM_TREE );
+    const std::size_t candidate_count =
+        std::min<std::size_t>(NUM_CANDIDATES_FROM_TREE, searchable_count);
+    std::vector<std::size_t> candidate_indexes(candidate_count);
+    std::vector<float> out_dists_sqr(candidate_count);
 
     TicToc t_tree_search;
-    nanoflann::KNNResultSet<float> knnsearch_result( NUM_CANDIDATES_FROM_TREE );
-    knnsearch_result.init( &candidate_indexes[0], &out_dists_sqr[0] );
-    polarcontext_tree_->index->findNeighbors( knnsearch_result, &curr_key[0] /* query */, nanoflann::SearchParams(10) ); 
+    nanoflann::KNNResultSet<float> knnsearch_result(candidate_count);
+    knnsearch_result.init(candidate_indexes.data(), out_dists_sqr.data());
+    polarcontext_tree_->index->findNeighbors(
+        knnsearch_result, curr_key.data(), nanoflann::SearchParams(10));
     t_tree_search.toc("Tree search");
 
-    /* 
-     *  step 2: pairwise distance (find optimal columnwise best-fit using cosine distance)
-     */
-    TicToc t_calc_dist;   
-    for ( int candidate_iter_idx = 0; candidate_iter_idx < NUM_CANDIDATES_FROM_TREE; candidate_iter_idx++ )
+    double min_dist = std::numeric_limits<double>::infinity();
+    int nn_align = 0;
+    int nn_idx = no_match;
+    TicToc t_calc_dist;
+    for (std::size_t candidate_index : candidate_indexes)
     {
-        MatrixXd polarcontext_candidate = polarcontexts_[ candidate_indexes[candidate_iter_idx] ];
-        std::pair<double, int> sc_dist_result = distanceBtnScanContext( curr_desc, polarcontext_candidate ); 
-        
-        double candidate_dist = sc_dist_result.first;
-        int candidate_align = sc_dist_result.second;
-
-        if( candidate_dist < min_dist )
+        MatrixXd polarcontext_candidate = polarcontexts_[candidate_index];
+        const std::pair<double, int> sc_dist_result =
+            distanceBtnScanContext(curr_desc, polarcontext_candidate);
+        if (std::isfinite(sc_dist_result.first) && sc_dist_result.first < min_dist)
         {
-            min_dist = candidate_dist;
-            nn_align = candidate_align;
-
-            nn_idx = candidate_indexes[candidate_iter_idx];
+            min_dist = sc_dist_result.first;
+            nn_align = sc_dist_result.second;
+            nn_idx = static_cast<int>(candidate_index);
         }
     }
     t_calc_dist.toc("Distance calc");
 
-    /* 
-     * loop threshold check
-     */
-    if( min_dist < SC_DIST_THRES)
+    if (nn_idx != no_match && min_dist < SC_DIST_THRES)
     {
-        loop_id = nn_idx; 
-    
-        // std::cout.precision(3); 
-        cout << "[Init found] Nearest distance: " << min_dist << " btn " << polarcontexts_.size()-1 << " and " << nn_idx << "." << endl;
+        cout << "[Init found] Nearest distance: " << min_dist << " btn "
+             << polarcontexts_.size() - 1 << " and " << nn_idx << "." << endl;
         cout << "[Init found] yaw diff: " << nn_align * PC_UNIT_SECTORANGLE << " deg." << endl;
-    }
-    else
-    {
-        std::cout.precision(3); 
-        cout << "[Not loop] Nearest distance: " << min_dist << " btn " << polarcontexts_.size()-1 << " and " << nn_idx << "." << endl;
-        cout << "[Not loop] yaw diff: " << nn_align * PC_UNIT_SECTORANGLE << " deg." << endl;
+        return {nn_idx, deg2rad(nn_align * PC_UNIT_SECTORANGLE)};
     }
 
-    // To do: return also nn_align (i.e., yaw diff)
-    float yaw_diff_rad = deg2rad(nn_align * PC_UNIT_SECTORANGLE);
-    std::pair<int, float> result {loop_id, yaw_diff_rad};
-
-    return result;
-
+    cout << "[Not localized] Nearest ScanContext distance: " << min_dist << "." << endl;
+    return {no_match, 0.0f};
 } // SCManager::detectLoopClosureID
 
 // } // namespace SC2

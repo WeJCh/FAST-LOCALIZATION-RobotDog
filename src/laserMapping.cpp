@@ -33,13 +33,22 @@
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 // POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
+#include <atomic>
+#include <cctype>
 #include <mutex>
 #include <math.h>
 #include <thread>
 #include <fstream>
+#include <iomanip>
+#include <sstream>
+#include <set>
 #include <csignal>
+#include <cerrno>
+#include <cstring>
+#include <ctime>
+#include <cstdint>
+#include <sys/stat.h>
 #include <unistd.h>
-#include <Python.h>
 #include <so3_math.h>
 #include <ros/ros.h>
 #include <Eigen/Core>
@@ -56,7 +65,9 @@
 #include <tf/transform_datatypes.h>
 #include <tf/transform_broadcaster.h>
 #include <geometry_msgs/Vector3.h>
+#ifdef FAST_LOCALIZATION_WITH_LIVOX
 #include <livox_ros_driver/CustomMsg.h>
+#endif
 #include "preprocess.h"
 #include <ikd-Tree/ikd_Tree.h>
 #include <chrono>
@@ -88,7 +99,18 @@ condition_variable sig_buffer;
 
 int localization_mode;
 string root_dir = ROOT_DIR;
-string map_file_path, lid_topic, imu_topic;
+string map_format = "fast_localization";
+string map_directory, map_keyframe_directory, map_pose_file, map_metadata_file;
+string lid_topic, imu_topic;
+bool wait_for_map_keypress = false;
+int initialization_required_matches = 2;
+int initialization_queue_capacity = 20;
+int initialization_icp_max_iterations = 60;
+double initialization_coarse_max_correspondence = 5.0;
+double initialization_fine_max_correspondence = 1.0;
+double initialization_icp_fitness_threshold = 0.35;
+double initialization_translation_consistency = 1.0;
+double initialization_rotation_consistency_deg = 10.0;
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
@@ -135,11 +157,20 @@ std::queue<std::pair<int, PointCloudXYZI::Ptr>> init_feats_down_bodys;
 int init_count = 0;
 std::pair<int, Eigen::Matrix4d> init_result;
 std::mutex global_localization_finish_state_mutex;
-bool global_localization_finish = false;
+std::atomic<bool> global_localization_finish(false);
 bool global_update = false;
+
+bool trajectory_auto_save = true;
+bool trajectory_recording_started = false;
+std::string trajectory_output_directory;
+std::string trajectory_csv_path;
+std::string trajectory_pcd_path;
+std::ofstream trajectory_csv_stream;
+std::vector<pcl::PointXYZRGB, Eigen::aligned_allocator<pcl::PointXYZRGB>> trajectory_points;
 
 std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> position_map;
 std::vector<Eigen::Quaterniond, Eigen::aligned_allocator<Eigen::Quaterniond>> pose_map;
+std::vector<std::string> map_keyframe_paths;
 
 std::vector<Eigen::Vector3d, Eigen::aligned_allocator<Eigen::Vector3d>> position_init;
 std::vector<Eigen::Quaterniond, Eigen::aligned_allocator<Eigen::Quaterniond>> pose_init;
@@ -187,6 +218,121 @@ inline void dump_lio_state_to_log(FILE *fp)
     fprintf(fp, "%lf %lf %lf ", state_point.grav[0], state_point.grav[1], state_point.grav[2]); // Bias_a  
     fprintf(fp, "\r\n");  
     fflush(fp);
+}
+
+bool ensureDirectoryExists(const std::string &directory)
+{
+    if (directory.empty()) return false;
+
+    std::size_t cursor = directory.front() == '/' ? 1 : 0;
+    while (true)
+    {
+        const std::size_t separator = directory.find('/', cursor);
+        const std::string partial = directory.substr(0, separator);
+        if (!partial.empty() && mkdir(partial.c_str(), 0755) != 0)
+        {
+            if (errno != EEXIST)
+            {
+                ROS_ERROR("Cannot create trajectory output directory %s: %s",
+                          partial.c_str(), strerror(errno));
+                return false;
+            }
+            struct stat status;
+            if (stat(partial.c_str(), &status) != 0 || !S_ISDIR(status.st_mode))
+            {
+                ROS_ERROR("Trajectory output path exists but is not a directory: %s", partial.c_str());
+                return false;
+            }
+        }
+        if (separator == std::string::npos) break;
+        cursor = separator + 1;
+    }
+    return true;
+}
+
+std::string trajectoryFileStem()
+{
+    std::time_t now = std::time(nullptr);
+    std::tm local_time;
+    localtime_r(&now, &local_time);
+    char time_buffer[32] = {0};
+    std::strftime(time_buffer, sizeof(time_buffer), "%Y%m%d_%H%M%S", &local_time);
+    return trajectory_output_directory + "/localization_trajectory_" +
+           std::string(time_buffer) + "_pid" + std::to_string(getpid());
+}
+
+void startTrajectoryRecording()
+{
+    if (!trajectory_auto_save || trajectory_recording_started) return;
+
+    if (trajectory_output_directory.empty())
+        trajectory_output_directory = root_dir + "/Log";
+    if (!ensureDirectoryExists(trajectory_output_directory))
+    {
+        ROS_ERROR("Automatic trajectory export is disabled because its output directory is unavailable.");
+        trajectory_auto_save = false;
+        return;
+    }
+
+    const std::string stem = trajectoryFileStem();
+    trajectory_csv_path = stem + ".csv";
+    trajectory_pcd_path = stem + ".pcd";
+    trajectory_csv_stream.open(trajectory_csv_path.c_str(), std::ios::out | std::ios::trunc);
+    if (!trajectory_csv_stream.is_open())
+    {
+        ROS_ERROR("Cannot open automatic trajectory CSV: %s", trajectory_csv_path.c_str());
+        trajectory_auto_save = false;
+        return;
+    }
+
+    trajectory_csv_stream << "timestamp_sec,x,y,z,qx,qy,qz,qw\n";
+    trajectory_csv_stream.flush();
+    trajectory_recording_started = true;
+    ROS_INFO("Automatic map-frame trajectory recording started. CSV: %s; red PCD will be saved at shutdown: %s",
+             trajectory_csv_path.c_str(), trajectory_pcd_path.c_str());
+}
+
+void appendTrajectoryPose(double timestamp)
+{
+    if (!trajectory_recording_started) return;
+
+    const Eigen::Quaterniond orientation(state_point.rot.toRotationMatrix());
+    trajectory_csv_stream << std::setprecision(17) << timestamp << ','
+                          << state_point.pos(0) << ',' << state_point.pos(1) << ',' << state_point.pos(2) << ','
+                          << orientation.x() << ',' << orientation.y() << ',' << orientation.z() << ','
+                          << orientation.w() << '\n';
+    trajectory_csv_stream.flush();
+
+    pcl::PointXYZRGB point;
+    point.x = static_cast<float>(state_point.pos(0));
+    point.y = static_cast<float>(state_point.pos(1));
+    point.z = static_cast<float>(state_point.pos(2));
+    point.r = 255;
+    point.g = 0;
+    point.b = 0;
+    trajectory_points.push_back(point);
+}
+
+void finishTrajectoryRecording()
+{
+    if (!trajectory_recording_started) return;
+
+    trajectory_csv_stream.close();
+    pcl::PointCloud<pcl::PointXYZRGB> trajectory_cloud;
+    trajectory_cloud.points = trajectory_points;
+    trajectory_cloud.width = static_cast<std::uint32_t>(trajectory_cloud.points.size());
+    trajectory_cloud.height = 1;
+    trajectory_cloud.is_dense = true;
+
+    const int write_status = pcl::io::savePCDFileBinary(trajectory_pcd_path, trajectory_cloud);
+    if (write_status < 0)
+    {
+        ROS_ERROR("Failed to save automatic trajectory PCD: %s", trajectory_pcd_path.c_str());
+        return;
+    }
+
+    ROS_INFO("Saved %zu map-frame trajectory poses. CSV: %s; red PCD: %s",
+             trajectory_points.size(), trajectory_csv_path.c_str(), trajectory_pcd_path.c_str());
 }
 
 void pointBodyToWorld_ikfom(PointType const * const pi, PointType * const po, state_ikfom &s)
@@ -325,6 +471,7 @@ void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
 
 double timediff_lidar_wrt_imu = 0.0;
 bool   timediff_set_flg = false;
+#ifdef FAST_LOCALIZATION_WITH_LIVOX
 void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg) 
 {
     mtx_buffer.lock();
@@ -358,6 +505,7 @@ void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg)
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 }
+#endif
 
 void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in) 
 {
@@ -775,153 +923,469 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     solve_time += omp_get_wtime() - solve_start_;
 }
 
-void load_file(ros::Publisher& global_map_pub)
+std::string mapKeyframePath(int keyframe_id)
 {
-    fstream pose_file;
-    pose_file.open(root_dir + "map/pose.json");
-    double tx, ty, tz, w, x, y, z;
-    int count = 0;
-    while(pose_file >> tx >> ty >> tz >> w >> x >> y >> z)
-    {
-        Eigen::Quaterniond q(w, x, y, z);
-        Eigen::Vector3d p(tx, ty, tz);
-        position_map.push_back(p);
-        pose_map.push_back(q);
-        pcl::PointCloud<pcl::PointXYZINormal>::Ptr temp(new pcl::PointCloud<pcl::PointXYZINormal>);
-        pcl::io::loadPCDFile(root_dir + "map/pcd/" + to_string(count) + ".pcd", *temp);
-        scManager.makeAndSaveScancontextAndKeys(*temp);
-        pcl::transformPointCloud(*temp, *temp, p, q);
-        *global_map += *temp;
-        sensor_msgs::PointCloud2 msg_global;
-        pcl::toROSMsg(*temp, msg_global);
-        msg_global.header.frame_id = "camera_init";
-        msg_global.header.stamp = ros::Time::now();
-        global_map_pub.publish(msg_global);
-        count++;
-    }
-    pose_file.close();
+    if (keyframe_id < 0 || keyframe_id >= static_cast<int>(map_keyframe_paths.size()))
+        return std::string();
+    return map_keyframe_paths[keyframe_id];
+}
 
+bool appendMapKeyframe(const std::string &cloud_path, const Eigen::Vector3d &position,
+                       Eigen::Quaterniond orientation, ros::Publisher &global_map_pub)
+{
+    if (!position.allFinite() || !std::isfinite(orientation.norm()) || orientation.norm() < 1e-9)
+    {
+        ROS_ERROR("Invalid pose for map keyframe: %s", cloud_path.c_str());
+        return false;
+    }
+    orientation.normalize();
+
+    PointCloudXYZI::Ptr local_cloud(new PointCloudXYZI);
+    if (pcl::io::loadPCDFile(cloud_path, *local_cloud) < 0 || local_cloud->empty())
+    {
+        ROS_ERROR("Cannot load non-empty map keyframe: %s", cloud_path.c_str());
+        return false;
+    }
+
+    map_keyframe_paths.push_back(cloud_path);
+    position_map.push_back(position);
+    pose_map.push_back(orientation);
+    scManager.makeAndSaveScancontextAndKeys(*local_cloud);
+
+    PointCloudXYZI::Ptr global_cloud(new PointCloudXYZI);
+    pcl::transformPointCloud(*local_cloud, *global_cloud, position, orientation);
+    *global_map += *global_cloud;
+
+    sensor_msgs::PointCloud2 msg_global;
+    pcl::toROSMsg(*global_cloud, msg_global);
+    msg_global.header.frame_id = "camera_init";
+    msg_global.header.stamp = ros::Time::now();
+    global_map_pub.publish(msg_global);
+    return true;
+}
+
+bool readMetadataVector(const std::string &metadata_path, const std::string &key,
+                        std::size_t expected_size, std::vector<double> *values)
+{
+    if (!values) return false;
+    std::ifstream metadata(metadata_path);
+    if (!metadata.is_open())
+    {
+        ROS_ERROR("Cannot open FAST-LIVO2 metadata: %s", metadata_path.c_str());
+        return false;
+    }
+
+    std::string line;
+    int line_number = 0;
+    while (std::getline(metadata, line))
+    {
+        ++line_number;
+        const std::size_t first = line.find_first_not_of(" \t\r");
+        if (first == std::string::npos || line.compare(first, key.size(), key) != 0)
+            continue;
+        std::size_t cursor = first + key.size();
+        while (cursor < line.size() && std::isspace(static_cast<unsigned char>(line[cursor]))) ++cursor;
+        if (cursor >= line.size() || line[cursor] != ':') continue;
+
+        const std::size_t open = line.find('[', cursor + 1);
+        const std::size_t close = line.find(']', open == std::string::npos ? cursor + 1 : open + 1);
+        if (open == std::string::npos || close == std::string::npos || close <= open)
+        {
+            ROS_ERROR("Malformed %s at %s:%d", key.c_str(), metadata_path.c_str(), line_number);
+            return false;
+        }
+
+        std::string payload = line.substr(open + 1, close - open - 1);
+        std::replace(payload.begin(), payload.end(), ',', ' ');
+        std::istringstream value_stream(payload);
+        values->clear();
+        double value;
+        while (value_stream >> value) values->push_back(value);
+        if (values->size() != expected_size)
+        {
+            ROS_ERROR("%s in %s must contain %zu values, found %zu",
+                      key.c_str(), metadata_path.c_str(), expected_size, values->size());
+            return false;
+        }
+        for (double item : *values)
+        {
+            if (!std::isfinite(item))
+            {
+                ROS_ERROR("%s in %s contains a non-finite value", key.c_str(), metadata_path.c_str());
+                return false;
+            }
+        }
+        return true;
+    }
+
+    ROS_ERROR("Missing %s in FAST-LIVO2 metadata: %s", key.c_str(), metadata_path.c_str());
+    return false;
+}
+
+std::string fastLivo2KeyframePath(const std::string &keyframe_directory, int source_id)
+{
+    std::ostringstream padded_name;
+    padded_name << keyframe_directory << "/" << std::setfill('0') << std::setw(6)
+                << source_id << ".pcd";
+    std::ifstream padded_file(padded_name.str(), std::ios::binary);
+    if (padded_file.good()) return padded_name.str();
+
+    const std::string raw_name = keyframe_directory + "/" + std::to_string(source_id) + ".pcd";
+    std::ifstream raw_file(raw_name, std::ios::binary);
+    if (raw_file.good()) return raw_name;
+    return padded_name.str();
+}
+
+bool loadFastLocalizationMap(ros::Publisher &global_map_pub)
+{
+    const std::string pose_path = map_pose_file.empty() ? map_directory + "/pose.json" : map_pose_file;
+    const std::string pcd_directory =
+        map_keyframe_directory.empty() ? map_directory + "/pcd" : map_keyframe_directory;
+    std::ifstream pose_file(pose_path);
+    if (!pose_file.is_open())
+    {
+        ROS_ERROR("Cannot open map pose file: %s", pose_path.c_str());
+        return false;
+    }
+
+    int count = 0;
+    int line_number = 0;
+    std::string pose_line;
+    while (std::getline(pose_file, pose_line))
+    {
+        ++line_number;
+        if (pose_line.find_first_not_of(" \t\r") == std::string::npos) continue;
+
+        double tx, ty, tz, w, x, y, z;
+        std::string extra_field;
+        std::istringstream pose_stream(pose_line);
+        if (!(pose_stream >> tx >> ty >> tz >> w >> x >> y >> z) ||
+            (pose_stream >> extra_field))
+        {
+            ROS_ERROR("Malformed map pose at line %d; expected exactly: tx ty tz qw qx qy qz", line_number);
+            return false;
+        }
+
+        Eigen::Quaterniond q(w, x, y, z);
+        const Eigen::Vector3d p(tx, ty, tz);
+        const std::string cloud_path = pcd_directory + "/" + std::to_string(count) + ".pcd";
+        if (!appendMapKeyframe(cloud_path, p, q, global_map_pub)) return false;
+        ++count;
+    }
+
+    if (count == 0)
+    {
+        ROS_ERROR("Map contains no keyframes: %s", map_directory.c_str());
+        return false;
+    }
+
+    ROS_INFO("Loaded %d standard FAST-LOCALIZATION keyframes from %s", count, map_directory.c_str());
+    return true;
+}
+
+bool loadFastLivo2Map(ros::Publisher &global_map_pub)
+{
+    const std::string keyframe_directory = map_keyframe_directory.empty()
+        ? map_directory + "/keyframes" : map_keyframe_directory;
+    std::string pose_path = map_pose_file;
+    if (pose_path.empty())
+    {
+        pose_path = map_directory + "/loop_backend/optimized_keyframe_poses_imu.txt";
+        std::ifstream optimized_pose_probe(pose_path);
+        if (!optimized_pose_probe.good())
+        {
+            pose_path = keyframe_directory + "/keyframe_poses_imu.txt";
+            ROS_WARN("Optimized FAST-LIVO2 poses are absent; falling back to unoptimized poses: %s",
+                     pose_path.c_str());
+        }
+    }
+    const std::string metadata_path = map_metadata_file.empty()
+        ? keyframe_directory + "/metadata.yaml" : map_metadata_file;
+
+    std::vector<double> translation_values;
+    std::vector<double> rotation_values;
+    if (!readMetadataVector(metadata_path, "T_imu_lidar_translation", 3, &translation_values) ||
+        !readMetadataVector(metadata_path, "T_imu_lidar_rotation_row_major", 9, &rotation_values))
+        return false;
+
+    Eigen::Matrix3d R_imu_lidar;
+    R_imu_lidar << rotation_values[0], rotation_values[1], rotation_values[2],
+                   rotation_values[3], rotation_values[4], rotation_values[5],
+                   rotation_values[6], rotation_values[7], rotation_values[8];
+    const Eigen::Matrix3d orthogonality = R_imu_lidar.transpose() * R_imu_lidar;
+    if (!R_imu_lidar.allFinite() ||
+        (orthogonality - Eigen::Matrix3d::Identity()).norm() > 1e-4 ||
+        std::abs(R_imu_lidar.determinant() - 1.0) > 1e-4)
+    {
+        ROS_ERROR("Invalid T_imu_lidar rotation in %s", metadata_path.c_str());
+        return false;
+    }
+    Eigen::Matrix4d T_imu_lidar = Eigen::Matrix4d::Identity();
+    T_imu_lidar.block<3, 3>(0, 0) = R_imu_lidar;
+    T_imu_lidar.block<3, 1>(0, 3) =
+        Eigen::Vector3d(translation_values[0], translation_values[1], translation_values[2]);
+
+    std::ifstream pose_file(pose_path);
+    if (!pose_file.is_open())
+    {
+        ROS_ERROR("Cannot open FAST-LIVO2 optimized pose file: %s", pose_path.c_str());
+        return false;
+    }
+
+    std::set<int> source_ids;
+    int count = 0;
+    int line_number = 0;
+    std::string pose_line;
+    while (std::getline(pose_file, pose_line))
+    {
+        ++line_number;
+        const std::size_t first = pose_line.find_first_not_of(" \t\r");
+        if (first == std::string::npos || pose_line[first] == '#') continue;
+
+        int source_id;
+        double timestamp, tx, ty, tz, qx, qy, qz, qw;
+        std::string extra_field;
+        std::istringstream pose_stream(pose_line);
+        if (!(pose_stream >> source_id >> timestamp >> tx >> ty >> tz >> qx >> qy >> qz >> qw) ||
+            (pose_stream >> extra_field))
+        {
+            ROS_ERROR("Malformed FAST-LIVO2 pose at %s:%d; expected: id timestamp tx ty tz qx qy qz qw",
+                      pose_path.c_str(), line_number);
+            return false;
+        }
+        if (source_id < 0 || !source_ids.insert(source_id).second || !std::isfinite(timestamp))
+        {
+            ROS_ERROR("Invalid or duplicate FAST-LIVO2 keyframe id at %s:%d", pose_path.c_str(), line_number);
+            return false;
+        }
+
+        Eigen::Quaterniond q_map_imu(qw, qx, qy, qz);
+        const Eigen::Vector3d p_map_imu(tx, ty, tz);
+        if (!p_map_imu.allFinite() || !std::isfinite(q_map_imu.norm()) || q_map_imu.norm() < 1e-9)
+        {
+            ROS_ERROR("Invalid FAST-LIVO2 IMU pose at %s:%d", pose_path.c_str(), line_number);
+            return false;
+        }
+        q_map_imu.normalize();
+
+        Eigen::Matrix4d T_map_imu = Eigen::Matrix4d::Identity();
+        T_map_imu.block<3, 3>(0, 0) = q_map_imu.toRotationMatrix();
+        T_map_imu.block<3, 1>(0, 3) = p_map_imu;
+        const Eigen::Matrix4d T_map_lidar = T_map_imu * T_imu_lidar;
+        Eigen::Quaterniond q_map_lidar(T_map_lidar.block<3, 3>(0, 0));
+        const Eigen::Vector3d p_map_lidar = T_map_lidar.block<3, 1>(0, 3);
+
+        const std::string cloud_path = fastLivo2KeyframePath(keyframe_directory, source_id);
+        if (!appendMapKeyframe(cloud_path, p_map_lidar, q_map_lidar, global_map_pub)) return false;
+        ++count;
+    }
+
+    if (count == 0)
+    {
+        ROS_ERROR("FAST-LIVO2 map contains no keyframes: %s", map_directory.c_str());
+        return false;
+    }
+
+    ROS_INFO("Loaded %d FAST-LIVO2 keyframes and %zu global points from %s",
+             count, global_map->size(), map_directory.c_str());
+    ROS_INFO("Applied map poses as T_map_lidar = T_map_imu * T_imu_lidar from %s",
+             metadata_path.c_str());
+    return true;
+}
+
+bool load_file(ros::Publisher &global_map_pub)
+{
+    position_map.clear();
+    pose_map.clear();
+    map_keyframe_paths.clear();
+    global_map->clear();
+
+    if (map_format == "fast_livo2") return loadFastLivo2Map(global_map_pub);
+    if (map_format == "fast_localization") return loadFastLocalizationMap(global_map_pub);
+
+    ROS_ERROR("Unsupported map/format '%s'; use 'fast_livo2' or 'fast_localization'",
+              map_format.c_str());
+    return false;
+}
+
+struct InitializationCandidate
+{
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    int frame_id = -1;
+    int map_keyframe_id = -1;
+    double fitness = std::numeric_limits<double>::infinity();
+    Eigen::Matrix4d T_map_imu = Eigen::Matrix4d::Identity();
+};
+
+bool localizeInitializationFrame(int frame_id, const PointCloudXYZI::Ptr &source_cloud,
+                                 InitializationCandidate *candidate)
+{
+    if (!candidate || !source_cloud || source_cloud->empty()) return false;
+
+    PointCloudXYZI::Ptr current_cloud(new PointCloudXYZI(*source_cloud));
+    scManager.makeAndSaveScancontextAndKeys(*current_cloud);
+    // The map descriptors precede the query; exclude exactly the query descriptor.
+    const std::pair<int, float> sc_match = scManager.detectLoopClosureID(1);
+    scManager.dropBackScancontextAndKeys();
+
+    const int localization_id = sc_match.first;
+    if (localization_id < 0 || localization_id >= static_cast<int>(position_map.size()))
+        return false;
+
+    Eigen::Matrix4d T_init_sc = Eigen::Matrix4d::Identity();
+    T_init_sc.block<3, 3>(0, 0) =
+        Eigen::AngleAxisd(-sc_match.second, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+    pcl::transformPointCloud(*current_cloud, *current_cloud, T_init_sc);
+
+    PointCloudXYZI::Ptr target_cloud(new PointCloudXYZI);
+    const std::string target_path = mapKeyframePath(localization_id);
+    if (pcl::io::loadPCDFile(target_path, *target_cloud) < 0 || target_cloud->empty())
+    {
+        ROS_WARN("Initialization target cannot be loaded: %s", target_path.c_str());
+        return false;
+    }
+
+    pcl::PointCloud<PointType>::Ptr aligned(new pcl::PointCloud<PointType>);
+    pcl::IterativeClosestPoint<PointType, PointType> coarse_icp;
+    coarse_icp.setMaximumIterations(initialization_icp_max_iterations);
+    coarse_icp.setMaxCorrespondenceDistance(initialization_coarse_max_correspondence);
+    coarse_icp.setTransformationEpsilon(1e-6);
+    coarse_icp.setEuclideanFitnessEpsilon(1e-6);
+    coarse_icp.setInputSource(current_cloud);
+    coarse_icp.setInputTarget(target_cloud);
+    coarse_icp.align(*aligned);
+    if (!coarse_icp.hasConverged())
+    {
+        ROS_WARN("Coarse initialization ICP did not converge for map keyframe %d", localization_id);
+        return false;
+    }
+
+    const Eigen::Matrix4d T_coarse = coarse_icp.getFinalTransformation().cast<double>();
+    if (!T_coarse.allFinite()) return false;
+    pcl::transformPointCloud(*current_cloud, *current_cloud, T_coarse);
+
+    pcl::IterativeClosestPoint<PointType, PointType> fine_icp;
+    fine_icp.setMaximumIterations(initialization_icp_max_iterations);
+    fine_icp.setMaxCorrespondenceDistance(initialization_fine_max_correspondence);
+    fine_icp.setTransformationEpsilon(1e-7);
+    fine_icp.setEuclideanFitnessEpsilon(1e-7);
+    fine_icp.setInputSource(current_cloud);
+    fine_icp.setInputTarget(target_cloud);
+    fine_icp.align(*aligned);
+    const double fitness = fine_icp.getFitnessScore();
+    if (!fine_icp.hasConverged() || !std::isfinite(fitness) ||
+        fitness > initialization_icp_fitness_threshold)
+    {
+        ROS_WARN("Fine initialization ICP rejected map keyframe %d (converged=%d, fitness=%.6f, threshold=%.6f)",
+                 localization_id, fine_icp.hasConverged(), fitness,
+                 initialization_icp_fitness_threshold);
+        return false;
+    }
+
+    const Eigen::Matrix4d T_fine = fine_icp.getFinalTransformation().cast<double>();
+    if (!T_fine.allFinite()) return false;
+    const Eigen::Matrix4d T_map_keyframe_lidar = [&]() {
+        Eigen::Matrix4d transform = Eigen::Matrix4d::Identity();
+        transform.block<3, 3>(0, 0) = pose_map[localization_id].toRotationMatrix();
+        transform.block<3, 1>(0, 3) = position_map[localization_id];
+        return transform;
+    }();
+    Eigen::Matrix4d T_imu_lidar = Eigen::Matrix4d::Identity();
+    T_imu_lidar.block<3, 3>(0, 0) = Lidar_R_wrt_IMU;
+    T_imu_lidar.block<3, 1>(0, 3) = Lidar_T_wrt_IMU;
+
+    const Eigen::Matrix4d T_map_imu =
+        T_map_keyframe_lidar * T_fine * T_coarse * T_init_sc * T_imu_lidar.inverse();
+    if (!T_map_imu.allFinite()) return false;
+
+    candidate->frame_id = frame_id;
+    candidate->map_keyframe_id = localization_id;
+    candidate->fitness = fitness;
+    candidate->T_map_imu = T_map_imu;
+    ROS_INFO("Initialization candidate: frame=%d map_keyframe=%d fitness=%.6f",
+             frame_id, localization_id, fitness);
+    return true;
+}
+
+bool initializationCandidatesConsistent(const InitializationCandidate &left,
+                                        const InitializationCandidate &right)
+{
+    const double translation =
+        (left.T_map_imu.block<3, 1>(0, 3) - right.T_map_imu.block<3, 1>(0, 3)).norm();
+    const Eigen::Matrix3d rotation_delta =
+        left.T_map_imu.block<3, 3>(0, 0).transpose() * right.T_map_imu.block<3, 3>(0, 0);
+    const double rotation_deg = Eigen::AngleAxisd(rotation_delta).angle() * 180.0 / M_PI;
+    return translation <= initialization_translation_consistency &&
+           rotation_deg <= initialization_rotation_consistency_deg;
 }
 
 void global_localization()
 {
     ros::Rate rate(20);
-    while (ros::ok())
+    std::vector<InitializationCandidate, Eigen::aligned_allocator<InitializationCandidate>> accepted;
+    while (ros::ok() && !flg_exit)
     {
-        std::unique_lock<std::mutex> lock_state(global_localization_finish_state_mutex);
-        bool global_localization_finish_state = global_localization_finish;
-        lock_state.unlock();
-
-        if (global_localization_finish_state)
-            continue;
-
-        // 初始化检查 两次成功初始化 位置增量小于阈值时通过检查
-        int init_check = 0;
-        // 重定位结果
-        std::vector<int> init_ids;
-        std::vector<Eigen::Matrix4d, Eigen::aligned_allocator<Eigen::Matrix4d>> init_poses;
-        while (init_check < 2)
+        bool localization_finished = false;
         {
-            std::unique_lock<std::mutex> lock_init_feats(init_feats_down_body_mutex);
-            int N = init_feats_down_bodys.size();
-            lock_init_feats.unlock();
-            if (N != 0)
+            std::lock_guard<std::mutex> state_lock(global_localization_finish_state_mutex);
+            localization_finished = global_localization_finish.load();
+        }
+        if (localization_finished)
+        {
+            rate.sleep();
+            continue;
+        }
+
+        std::pair<int, PointCloudXYZI::Ptr> init_pair;
+        bool has_init_frame = false;
+        {
+            std::lock_guard<std::mutex> queue_lock(init_feats_down_body_mutex);
+            if (!init_feats_down_bodys.empty())
             {
-                // 获得初始化阶段去畸变后的当前帧点云
-                lock_init_feats.lock();
-                auto init_pair = init_feats_down_bodys.front();
+                init_pair = init_feats_down_bodys.front();
                 init_feats_down_bodys.pop();
-                lock_init_feats.unlock();
-
-                int current_init_id = init_pair.first;
-                PointCloudXYZI::Ptr current_init_pc_origin = init_pair.second;
-                PointCloudXYZI::Ptr current_init_pc(new PointCloudXYZI);
-                pcl::copyPointCloud(*current_init_pc_origin, *current_init_pc);
-
-                scManager.makeAndSaveScancontextAndKeys(*current_init_pc);
-                // 获得全局定位ID
-                int localization_id = scManager.detectLoopClosureID().first;
-                float yaw_init = scManager.detectLoopClosureID().second;
-
-                if (localization_id == -1)
-                {
-                    init_check = 0;
-                    continue;
-                }
-
-                Eigen::AngleAxisd yaw(-yaw_init, Eigen::Vector3d(0, 0, 1));
-                Eigen::Matrix4d T_init_sc = Eigen::Matrix4d::Identity();
-                T_init_sc.block<3, 3>(0, 0) = Eigen::Matrix3d(yaw);
-                pcl::transformPointCloud(*current_init_pc, *current_init_pc, T_init_sc);
-                ROS_INFO("Global match map id = %d", localization_id);
-                // 加载匹配地图帧 及 状态
-                PointCloudXYZI::Ptr current_loop_pc(new PointCloudXYZI);
-                pcl::io::loadPCDFile(root_dir + "map/pcd/" + to_string(localization_id) + ".pcd", *current_loop_pc);
-                Eigen::Vector3d p = position_map[localization_id];
-                Eigen::Quaterniond q = pose_map[localization_id];
-
-                Eigen::Matrix4d T_corr = Eigen::Matrix4d::Identity();
-
-
-                pcl::IterativeClosestPoint<PointType, PointType> icp;
-                icp.setMaxCorrespondenceDistance(5);
-
-                icp.setInputSource(current_init_pc);
-                icp.setInputTarget(current_loop_pc);
-                pcl::PointCloud<PointType>::Ptr unused(new pcl::PointCloud<PointType>);
-                icp.align(*unused);
-                Eigen::Matrix4d T_corr_current = icp.getFinalTransformation().cast<double>();
-                pcl::transformPointCloud(*current_init_pc, *current_init_pc, T_corr_current);
-                T_corr = T_corr_current * T_init_sc;
-
-                icp.setMaxCorrespondenceDistance(1);
-
-                icp.setInputSource(current_init_pc);
-                icp.setInputTarget(current_loop_pc);
-                icp.align(*unused);
-                T_corr_current = icp.getFinalTransformation().cast<double>();
-                pcl::transformPointCloud(*current_init_pc, *current_init_pc, T_corr_current);
-                T_corr = (T_corr_current * T_corr).eval();
-
-                cout << T_corr << endl;
-
-                Eigen::Matrix4d T_or = Eigen::Matrix4d::Identity();
-                T_or.block<3, 3>(0, 0) = q.toRotationMatrix();
-                T_or.block<3, 1>(0, 3) = p;
-
-                Eigen::Matrix4d T_i_l = Eigen::Matrix4d::Identity();
-                T_i_l.block<3, 3>(0, 0) = Lidar_R_wrt_IMU;
-                T_i_l.block<3, 1>(0, 3) = Lidar_T_wrt_IMU;
-
-                Eigen::Matrix4d T = T_or * T_corr * T_i_l.inverse();
-
-                init_poses.push_back(T);
-                init_ids.push_back(current_init_id);
-                scManager.dropBackScancontextAndKeys();
-                init_check++;
+                has_init_frame = true;
             }
         }
+        if (!has_init_frame)
+        {
+            rate.sleep();
+            continue;
+        }
 
-        Eigen::Vector3d pos_diff = init_poses[0].block<3, 1>(0, 3) - init_poses[1].block<3, 1>(0, 3);
-        if (pos_diff.norm() < 2)
+        InitializationCandidate candidate;
+        if (!localizeInitializationFrame(init_pair.first, init_pair.second, &candidate))
         {
-            lock_state.lock();
-            global_localization_finish = true;
-            lock_state.unlock();
-            ROS_INFO("Global localization successfully");
-            init_result.first = init_ids[0];
-            init_result.second = init_poses[0];
-            std::queue<std::pair<int, PointCloudXYZI::Ptr>> swap_empty;
-            std::unique_lock<std::mutex> lock_init_feats(init_feats_down_body_mutex);
-            swap(init_feats_down_bodys, swap_empty);
-            lock_init_feats.unlock();
+            accepted.clear();
+            continue;
         }
-        else
+
+        if (!accepted.empty() && !initializationCandidatesConsistent(accepted.back(), candidate))
         {
-            init_ids.clear();
-            init_poses.clear();
+            ROS_WARN("Initialization candidates are inconsistent; restarting confirmation window.");
+            accepted.clear();
         }
-        rate.sleep();
+        accepted.push_back(candidate);
+        if (accepted.size() < static_cast<std::size_t>(initialization_required_matches))
+            continue;
+
+        const InitializationCandidate *best = &accepted.front();
+        for (const InitializationCandidate &item : accepted)
+            if (item.fitness < best->fitness) best = &item;
+
+        {
+            std::lock_guard<std::mutex> state_lock(global_localization_finish_state_mutex);
+            init_result.first = best->frame_id;
+            init_result.second = best->T_map_imu;
+            global_localization_finish.store(true);
+        }
+        {
+            std::lock_guard<std::mutex> queue_lock(init_feats_down_body_mutex);
+            std::queue<std::pair<int, PointCloudXYZI::Ptr>> empty;
+            init_feats_down_bodys.swap(empty);
+        }
+        ROS_INFO("Global localization confirmed with %zu consistent matches (best fitness %.6f).",
+                 accepted.size(), best->fitness);
     }
 }
 
@@ -931,12 +1395,27 @@ int main(int argc, char** argv)
     ros::NodeHandle nh;
 
     nh.param<bool>("publish/path_en",path_en, true);
-    nh.param<int>("common/localization_mode", localization_mode, 1);
+    nh.param<bool>("trajectory/auto_save", trajectory_auto_save, true);
+    nh.param<string>("trajectory/output_directory", trajectory_output_directory, "");
+    nh.param<int>("common/localization_mode", localization_mode, 2);
     nh.param<bool>("publish/scan_publish_en",scan_pub_en, true);
     nh.param<bool>("publish/dense_publish_en",dense_pub_en, true);
     nh.param<bool>("publish/scan_bodyframe_pub_en",scan_body_pub_en, true);
     nh.param<int>("max_iteration",NUM_MAX_ITERATIONS,4);
-    nh.param<string>("map_file_path",map_file_path,"");
+    nh.param<string>("map/format", map_format, "fast_localization");
+    nh.param<string>("map/directory", map_directory, root_dir + "map");
+    nh.param<string>("map/keyframe_directory", map_keyframe_directory, "");
+    nh.param<string>("map/pose_file", map_pose_file, "");
+    nh.param<string>("map/metadata_file", map_metadata_file, "");
+    nh.param<bool>("map/wait_for_keypress", wait_for_map_keypress, false);
+    nh.param<int>("initialization/required_consistent_matches", initialization_required_matches, 2);
+    nh.param<int>("initialization/queue_capacity", initialization_queue_capacity, 20);
+    nh.param<int>("initialization/icp_max_iterations", initialization_icp_max_iterations, 60);
+    nh.param<double>("initialization/coarse_max_correspondence_m", initialization_coarse_max_correspondence, 5.0);
+    nh.param<double>("initialization/fine_max_correspondence_m", initialization_fine_max_correspondence, 1.0);
+    nh.param<double>("initialization/icp_fitness_threshold", initialization_icp_fitness_threshold, 0.35);
+    nh.param<double>("initialization/translation_consistency_m", initialization_translation_consistency, 1.0);
+    nh.param<double>("initialization/rotation_consistency_deg", initialization_rotation_consistency_deg, 10.0);
     nh.param<string>("common/lid_topic",lid_topic,"/livox/lidar");
     nh.param<string>("common/imu_topic", imu_topic,"/livox/imu");
     nh.param<bool>("common/time_sync_en", time_sync_en, false);
@@ -965,6 +1444,22 @@ int main(int argc, char** argv)
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
+
+    if (localization_mode != 2)
+        ROS_WARN("Only automatic ScanContext initialization is implemented; forcing common/localization_mode=2.");
+    localization_mode = 2;
+    initialization_required_matches = std::max(2, initialization_required_matches);
+    initialization_queue_capacity = std::max(initialization_required_matches, initialization_queue_capacity);
+    if (map_directory.empty())
+    {
+        ROS_FATAL("map/directory must point to a FAST-LIVO2 run directory or a FAST-LOCALIZATION map directory.");
+        return 2;
+    }
+    if (extrinT.size() != 3 || extrinR.size() != 9)
+    {
+        ROS_FATAL("mapping/extrinsic_T must contain 3 values and mapping/extrinsic_R must contain 9 values.");
+        return 2;
+    }
     
     path.header.stamp    = ros::Time::now();
     path.header.frame_id ="camera_init";
@@ -1013,9 +1508,20 @@ int main(int argc, char** argv)
         cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
     /*** ROS subscribe initialization ***/
-    ros::Subscriber sub_pcl = p_pre->lidar_type == AVIA ? \
-        nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : \
-        nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
+    ros::Subscriber sub_pcl;
+    if (p_pre->lidar_type == AVIA)
+    {
+#ifdef FAST_LOCALIZATION_WITH_LIVOX
+        sub_pcl = nh.subscribe(lid_topic, 200000, livox_pcl_cbk);
+#else
+        ROS_FATAL("LiDAR type AVIA requires rebuilding with -DFAST_LOCALIZATION_WITH_LIVOX=ON and an installed livox_ros_driver package.");
+        return 2;
+#endif
+    }
+    else
+    {
+        sub_pcl = nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
+    }
     ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
     ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>
             ("/cloud_registered", 100000);
@@ -1037,10 +1543,13 @@ int main(int argc, char** argv)
     bool status = ros::ok();
 
     // load global map
-    ROS_INFO("Press any key to load map");
-    getchar();
+    if (wait_for_map_keypress)
+    {
+        ROS_INFO("Press Enter to load map");
+        getchar();
+    }
     // load pcd and build map sc
-    load_file(pubGlobalMap);
+    if (!load_file(pubGlobalMap)) return 3;
     // build global ikdtree
     ikdtree_global.set_downsample_param(filter_size_map_min);
     ikdtree_global.Build(global_map->points);
@@ -1055,7 +1564,7 @@ int main(int argc, char** argv)
         {
             // 检查是否需要更新全局定位
             std::unique_lock<std::mutex> lock_state(global_localization_finish_state_mutex);
-            if (global_localization_finish && !global_update)
+            if (global_localization_finish.load() && !global_update)
             {
                 int init_id = init_result.first;
                 Eigen::Vector3d init_time_p = position_init[init_id];
@@ -1078,8 +1587,16 @@ int main(int argc, char** argv)
                 global_state.rot = T_map_current.block<3, 3>(0, 0);
                 kf.change_x(global_state);
                 state_point = kf.get_x();
-                ikdtree = std::move(ikdtree_global);
+                // KD_TREE owns raw nodes and a rebuild pthread. It has no safe
+                // move assignment, so assigning it would shallow-copy those
+                // resources and cause a double free on shutdown. Rebuild the
+                // active tree from the immutable global map instead.
+                ikdtree_global.Reset();
+                ikdtree.Reset();
+                ikdtree.set_downsample_param(filter_size_map_min);
+                ikdtree.Build(global_map->points);
                 global_update = true;
+                startTrajectoryRecording();
             }
             lock_state.unlock();
 
@@ -1190,19 +1707,18 @@ int main(int argc, char** argv)
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped);
+            appendTrajectoryPose(lidar_end_time);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
-            if (!global_localization_finish)
+            if (!global_localization_finish.load())
             {
-                std::unique_lock<std::mutex> lock_init_feats(init_feats_down_body_mutex);
                 map_incremental();
-                lock_init_feats.unlock();
             }
             t5 = omp_get_wtime();
 
             /******* Publish points *******/
-            if (path_en && global_localization_finish)                         publish_path(pubPath);
+            if (path_en && global_localization_finish.load())                  publish_path(pubPath);
             if (scan_pub_en || pcd_save_en)      publish_frame_world(pubLaserCloudFull);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
             // publish_effect_world(pubLaserCloudEffect);
@@ -1210,13 +1726,15 @@ int main(int argc, char** argv)
 
 
             // for init
-            if (!global_localization_finish)
+            if (!global_localization_finish.load())
             {
                 position_init.push_back(state_point.pos);
                 pose_init.push_back(state_point.rot);
-                std::unique_lock<std::mutex> lock_init_feats(init_feats_down_body_mutex);
-                init_feats_down_bodys.push(std::make_pair(init_count, feats_down_body));
-                lock_init_feats.unlock();
+                PointCloudXYZI::Ptr init_cloud(new PointCloudXYZI(*feats_down_body));
+                std::lock_guard<std::mutex> lock_init_feats(init_feats_down_body_mutex);
+                while (static_cast<int>(init_feats_down_bodys.size()) >= initialization_queue_capacity)
+                    init_feats_down_bodys.pop();
+                init_feats_down_bodys.push(std::make_pair(init_count, init_cloud));
                 init_count++;
             }
 
@@ -1261,6 +1779,10 @@ int main(int argc, char** argv)
         status = ros::ok();
         rate.sleep();
     }
+
+    if (global_localization_thread.joinable()) global_localization_thread.join();
+
+    finishTrajectoryRecording();
 
     /**************** save map ****************/
     /* 1. make sure you have enough memories

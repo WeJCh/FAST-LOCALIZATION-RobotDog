@@ -41,11 +41,13 @@ void Preprocess::set(bool feat_en, int lid_type, double bld, int pfilt_num)
   point_filter_num = pfilt_num;
 }
 
+#ifdef FAST_LOCALIZATION_WITH_LIVOX
 void Preprocess::process(const livox_ros_driver::CustomMsg::ConstPtr &msg, PointCloudXYZI::Ptr &pcl_out)
-{  
+{
   avia_handler(msg);
   *pcl_out = pl_surf;
 }
+#endif
 
 void Preprocess::process(const sensor_msgs::PointCloud2::ConstPtr &msg, PointCloudXYZI::Ptr &pcl_out)
 {
@@ -77,14 +79,20 @@ void Preprocess::process(const sensor_msgs::PointCloud2::ConstPtr &msg, PointClo
   case VELO16:
     velodyne_handler(msg);
     break;
+
+  case ROBOTDOG:
+    robotdog_handler(msg);
+    break;
   
   default:
-    printf("Error LiDAR Type");
+    ROS_ERROR_THROTTLE(1.0, "Unsupported PointCloud2 LiDAR type: %d", lidar_type);
+    pl_surf.clear();
     break;
   }
   *pcl_out = pl_surf;
 }
 
+#ifdef FAST_LOCALIZATION_WITH_LIVOX
 void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
 {
   pl_surf.clear();
@@ -181,6 +189,7 @@ void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
     }
   }
 }
+#endif
 
 void Preprocess::oust64_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
 {
@@ -449,6 +458,57 @@ void Preprocess::velodyne_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
         }
       }
     }
+}
+
+void Preprocess::robotdog_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
+{
+  pl_surf.clear();
+  pl_corn.clear();
+  pl_full.clear();
+
+  pcl::PointCloud<robotdog_ros::Point> pl_orig;
+  pcl::fromROSMsg(*msg, pl_orig);
+  const int plsize = static_cast<int>(pl_orig.size());
+  if (plsize == 0) return;
+
+  pl_surf.reserve(plsize);
+  const int filter_stride = std::max(1, point_filter_num);
+  const double blind_squared = blind * blind;
+
+  for (int i = 0; i < plsize; ++i)
+  {
+    if (i % filter_stride != 0) continue;
+
+    const robotdog_ros::Point &pt = pl_orig.points[i];
+    const double x = pt.x;
+    const double y = pt.y;
+    const double z = pt.z;
+    const double distance_squared = x * x + y * y + z * z;
+    if (distance_squared < blind_squared || !std::isfinite(x) || !std::isfinite(y) ||
+        !std::isfinite(z) || !std::isfinite(pt.timestamp) || pt.timestamp < 0.0 ||
+        pt.line >= N_SCANS)
+    {
+      continue;
+    }
+
+    PointType added_pt;
+    added_pt.x = pt.x;
+    added_pt.y = pt.y;
+    added_pt.z = pt.z;
+    added_pt.intensity = pt.intensity;
+    added_pt.normal_x = 0.0f;
+    added_pt.normal_y = 0.0f;
+    added_pt.normal_z = 0.0f;
+    // RobotDog timestamp is a per-frame nanosecond offset. Curvature is milliseconds.
+    added_pt.curvature = static_cast<float>(pt.timestamp / 1e6);
+    pl_surf.points.push_back(added_pt);
+  }
+
+  // sync_packages() uses the final point's curvature as the scan duration.
+  std::sort(pl_surf.points.begin(), pl_surf.points.end(),
+            [](const PointType &left, const PointType &right) {
+              return left.curvature < right.curvature;
+            });
 }
 
 void Preprocess::give_feature(pcl::PointCloud<PointType> &pl, vector<orgtype> &types)

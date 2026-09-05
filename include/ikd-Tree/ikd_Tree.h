@@ -308,6 +308,12 @@ private:
 public:
     KD_TREE(float delete_param = 0.5, float balance_param = 0.6, float box_length = 0.2);
     ~KD_TREE();
+    KD_TREE(const KD_TREE &) = delete;
+    KD_TREE &operator=(const KD_TREE &) = delete;
+    // Stop the rebuild thread, discard all owned tree data, and start a fresh
+    // empty tree. KD_TREE owns pthread and raw-node resources, so it must not
+    // be copied or assigned to transfer a map between instances.
+    void Reset();
     void Set_delete_criterion_param(float delete_param)
     {
         delete_criterion_param = delete_param;

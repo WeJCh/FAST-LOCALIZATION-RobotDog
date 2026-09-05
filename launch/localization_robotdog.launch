@@ -1,0 +1,26 @@
+<launch>
+  <arg name="rviz" default="false" />
+  <arg name="map_format" default="fast_livo2" />
+  <arg name="map_dir" default="$(env HOME)/catkin_ws/src/FAST-LIVO2/Log/nav_runs/indoor_01" />
+  <arg name="trajectory_dir" default="" />
+
+  <rosparam command="load" file="$(find fast_localization)/config/robotdog.yaml" />
+  <param name="map/format" value="$(arg map_format)" type="str" />
+  <param name="map/directory" value="$(arg map_dir)" type="str" />
+  <param name="trajectory/output_directory" value="$(arg trajectory_dir)" type="str" />
+
+  <param name="feature_extract_enable" value="false" type="bool" />
+  <param name="point_filter_num" value="1" type="int" />
+  <param name="max_iteration" value="5" type="int" />
+  <param name="filter_size_surf" value="0.10" type="double" />
+  <param name="filter_size_map" value="0.20" type="double" />
+  <param name="cube_side_length" value="1000" type="double" />
+  <param name="runtime_pos_log_enable" value="false" type="bool" />
+
+  <node pkg="fast_localization" type="fast_localization" name="fastLocalization" output="screen" />
+
+  <group if="$(arg rviz)">
+    <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz"
+          args="-d $(find fast_localization)/rviz_cfg/loam_livox.rviz" />
+  </group>
+</launch>

@@ -1463,7 +1463,7 @@ int main(int argc, char** argv)
         return 2;
     }
     
-    path.header.stamp    = node->now().to_msg();
+    path.header.stamp    = stamp_from_nanoseconds(node->now().nanoseconds());
     path.header.frame_id ="camera_init";
 
     /*** variables definition ***/

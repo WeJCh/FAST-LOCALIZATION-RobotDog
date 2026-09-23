@@ -1,63 +1,76 @@
-common:
-    lid_topic: "/front_lidar"
-    imu_topic: "/front_lidar/imu"
-    time_sync_en: false
-    time_offset_lidar_to_imu: 0.0
-    localization_mode: 2
+fast_localization:
+  ros__parameters:
+    common:
+      lid_topic: "/front_lidar"
+      imu_topic: "/front_lidar/imu"
+      time_sync_en: false
+      time_offset_lidar_to_imu: 0.0
+      localization_mode: 2
 
-preprocess:
-    lidar_type: 8              # RobotDog PointCloud2: x/y/z/intensity/tag/line/timestamp
-    scan_line: 4
-    timestamp_unit: 3          # Kept explicit; RobotDog handler converts nanoseconds directly.
-    scan_rate: 10
-    blind: 0.8
+    preprocess:
+      # PointCloud2: x/y/z/intensity/tag/line/timestamp. The timestamp field
+      # is a per-frame nanosecond offset and is converted to milliseconds.
+      lidar_type: 8
+      scan_line: 4
+      timestamp_unit: 3
+      scan_rate: 10
+      blind: 0.8
 
-mapping:
-    acc_cov: 0.5
-    gyr_cov: 0.3
-    b_acc_cov: 0.0001
-    b_gyr_cov: 0.0001
-    fov_degree: 360
-    det_range: 100.0
-    extrinsic_est_en: false
-    # LiDAR -> IMU, identical to FAST-LIVO2 config/robotdog.yaml.
-    extrinsic_T: [-0.011, -0.02329, 0.04412]
-    extrinsic_R: [1, 0, 0,
-                  0, 1, 0,
-                  0, 0, 1]
+    mapping:
+      acc_cov: 0.5
+      gyr_cov: 0.3
+      b_acc_cov: 0.0001
+      b_gyr_cov: 0.0001
+      fov_degree: 360.0
+      det_range: 100.0
+      extrinsic_est_en: false
+      # LiDAR -> IMU. Validate the transform convention on the target system
+      # before changing these factory-calibration values.
+      extrinsic_T: [-0.011, -0.02329, 0.04412]
+      extrinsic_R: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
 
-initialization:
-    required_consistent_matches: 2
-    queue_capacity: 20
-    icp_max_iterations: 60
-    coarse_max_correspondence_m: 5.0
-    fine_max_correspondence_m: 1.0
-    icp_fitness_threshold: 0.35
-    translation_consistency_m: 1.0
-    rotation_consistency_deg: 10.0
+    initialization:
+      required_consistent_matches: 2
+      queue_capacity: 20
+      icp_max_iterations: 60
+      coarse_max_correspondence_m: 5.0
+      fine_max_correspondence_m: 1.0
+      icp_fitness_threshold: 0.35
+      translation_consistency_m: 1.0
+      rotation_consistency_deg: 10.0
 
-map:
-    # Native FAST-LIVO2 run layout: keyframes/metadata.yaml and
-    # loop_backend/optimized_keyframe_poses_imu.txt under map/directory.
-    format: "fast_livo2"
-    keyframe_directory: ""   # Optional override; empty derives <directory>/keyframes.
-    # Empty prefers optimized poses and falls back to keyframes/keyframe_poses_imu.txt.
-    pose_file: ""
-    metadata_file: ""        # Optional override; empty uses keyframes/metadata.yaml.
-    wait_for_keypress: false
+    map:
+      format: "fast_livo2"
+      directory: ""
+      keyframe_directory: ""
+      pose_file: ""
+      metadata_file: ""
+      wait_for_keypress: false
 
-trajectory:
-    # On successful global initialization, write map-frame poses continuously to CSV
-    # and save a red PointXYZRGB PCD on normal node shutdown. Empty uses <package>/Log.
-    auto_save: true
-    output_directory: ""
+    trajectory:
+      auto_save: true
+      output_directory: ""
 
-publish:
-    path_en: true
-    scan_publish_en: true
-    dense_publish_en: true
-    scan_bodyframe_pub_en: true
+    publish:
+      # False by default so a later integration cannot accidentally compete
+      # with an existing TF publisher.
+      tf: false
+      path_en: true
+      scan_publish_en: true
+      dense_publish_en: true
+      scan_bodyframe_pub_en: true
 
-pcd_save:
-    pcd_save_en: false
-    interval: -1
+    pcd_save:
+      pcd_save_en: false
+      interval: -1
+
+    max_iteration: 5
+    filter_size_corner: 0.1
+    filter_size_surf: 0.1
+    filter_size_map: 0.2
+    cube_side_length: 1000.0
+    point_filter_num: 1
+    feature_extract_enable: false
+    runtime_pos_log_enable: false
